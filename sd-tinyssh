@@ -1,32 +1,61 @@
 #!/bin/bash
 
 build() {
+    # Host key sources, in order of preference:
+    #   1. public key + secret key encrypted with systemd-creds
+    #   2. public key + secret key in cleartext
+    #   3. OpenSSH host key of the running system, converted on the fly
+
+    # tinysshd and tinyssh-convert are taken from the host installation, so the package must be installed
     if ! pacman -Qi tinyssh >/dev/null 2>&1; then
         error "Package tinyssh not installed"
         return 1
     fi
 
+    # mkinitcpio does not source the helpers when the hook is run standalone
     declare -F add_busybox >/dev/null || . /usr/lib/initcpio/functions.d/systemd-extras
 
     add_busybox || return
 
-    local encrypted keydir="${SD_TINYSSH_KEYDIR:-/etc/tinyssh/sshkeydir}"
-    if [[ -r "$keydir/ed25519.pk" && -r "$keydir/.ed25519.sk.enc" ]]; then
-        add_file "$keydir/ed25519.pk" /etc/credstore/ed25519.pk
-        add_file "$keydir/.ed25519.sk.enc" /etc/credstore.encrypted/.ed25519.sk
+    # variable and defaults definition
+    local keydir="${SD_TINYSSH_KEYDIR:-/etc/tinyssh/sshkeydir}"
+    local public_key="$keydir/ed25519.pk"
+    local secret_key="$keydir/.ed25519.sk"
+    local secret_key_encrypted="$keydir/.ed25519.sk.enc"
+    local openssh_host_key=/etc/ssh/ssh_host_ed25519_key
+
+    # appended to 'LoadCredential' in the service drop-in below
+    local encrypted=
+
+    # Option A. check if the public key and the encrypted secret key are readable
+    if [[ -r "$public_key" && -r "$secret_key_encrypted" ]]; then
+
+        add_file "$public_key" /etc/credstore/ed25519.pk
+        add_file "$secret_key_encrypted" /etc/credstore.encrypted/.ed25519.sk
         encrypted=Encrypted
-    elif [[ -r "$keydir/ed25519.pk" && -r "$keydir/.ed25519.sk" ]]; then
-        add_file "$keydir/ed25519.pk" /etc/credstore/ed25519.pk
-        add_file "$keydir/.ed25519.sk" /etc/credstore/.ed25519.sk
-    elif [[ -z "$SD_TINYSSH_KEYDIR" && -r /etc/ssh/ssh_host_ed25519_key ]]; then
-        tinyssh-convert "$BUILDROOT/etc/credstore" </etc/ssh/ssh_host_ed25519_key
+
+    # Option B. check if the public key and the cleartext secret key are readable
+    elif [[ -r "$public_key" && -r "$secret_key" ]]; then
+
+        add_file "$public_key" /etc/credstore/ed25519.pk
+        add_file "$secret_key" /etc/credstore/.ed25519.sk
+
+    # Option C. fall back to the OpenSSH host key if no key directory is specified and the key is readable
+    elif [[ -z "$SD_TINYSSH_KEYDIR" && -r "$openssh_host_key" ]]; then
+
+        tinyssh-convert "$BUILDROOT/etc/credstore" <"$openssh_host_key"
         warning "Reusing the SSH host keys from the regular operating environment poses a security risk."
-        warning "See https://github.com/wolegis/mkinitcpio-systemd-extras/wiki/TinySSH-server for details."
+        warning "Initramfs is unencrypted and the SSH host key is exposed, so impersonation is easily possible."
+
+    # Option D. no valid key found
     else
+
         error "Missing SSH host key"
         return 1
+
     fi
 
+    # add the systemd units for tinyssh
     add_systemd_unit tinyssh@.socket
     add_systemd_unit tinyssh@.service
 
@@ -36,8 +65,10 @@ build() {
         error "Illegal value SD_TINYSSH_PORT=$SD_TINYSSH_PORT"
         return 1
     fi
+    # create the symlink for the tinyssh socket in the systemd wants directory
     add_symlink "/etc/systemd/system/sysinit.target.wants/tinyssh@$SD_TINYSSH_PORT.socket" /usr/lib/systemd/system/tinyssh@.socket
 
+    # create the systemd drop-in for the tinyssh socket
     local drop_in=(
         '[Unit]'
         'Requires=systemd-networkd.service'
@@ -46,6 +77,7 @@ build() {
     )
     printf "%s\n" "${drop_in[@]}" | add_systemd_drop_in "tinyssh@$SD_TINYSSH_PORT.socket" override
 
+    # create the systemd drop-in for the tinyssh service
     drop_in=(
         "[Unit]"
         "DefaultDependencies=no"
@@ -59,12 +91,19 @@ build() {
     )
     printf "%s\n" "${drop_in[@]}" | add_systemd_drop_in tinyssh@.service override
 
+    # check for the presence of the authorized keys file for root
     SD_TINYSSH_AUTHORIZED_KEYS=${SD_TINYSSH_AUTHORIZED_KEYS:-/root/.ssh/authorized_keys}
+
+    # ensure the authorized keys file is readable
     if [[ ! -r "$SD_TINYSSH_AUTHORIZED_KEYS" ]]; then
         error "Keys file '$SD_TINYSSH_AUTHORIZED_KEYS' does not exist (or not readable)"
         return 1
     fi
+
+    # create the .ssh directory for root in the initramfs
     add_dir /root/.ssh
+
+    # tinyssh speaks ED25519 only, so every other key type is dropped here
     grep '^ssh-ed25519 ' "$SD_TINYSSH_AUTHORIZED_KEYS" >"$BUILDROOT/root/.ssh/authorized_keys"
     if [[ -s "$BUILDROOT/root/.ssh/authorized_keys" ]]; then
         chmod 600 "$BUILDROOT/root/.ssh/authorized_keys"
@@ -74,6 +113,7 @@ build() {
         return 1
     fi
 
+    # the login script is pointless when a fixed command replaces the shell
     if [[ -z "$SD_TINYSSH_COMMAND" && -r "$SD_TINYSSH_SCRIPT" ]]; then
         add_file "$SD_TINYSSH_SCRIPT" /root/.profile 600
     fi
