@@ -35,6 +35,7 @@ build() {
     # Option A. check if the public key and the encrypted secret key are readable
     if [[ -r "$public_key" && -r "$secret_key_encrypted" ]]; then
 
+        quiet "host key: '%s' and the secret key '%s' encrypted with systemd-creds" "$public_key" "$secret_key_encrypted"
         add_file "$public_key" "$srcdir/ed25519.pk"
         add_file "$secret_key_encrypted" "$srcdir/.ed25519.sk.enc"
         add_binary systemd-creds
@@ -42,12 +43,14 @@ build() {
     # Option B. check if the public key and the cleartext secret key are readable
     elif [[ -r "$public_key" && -r "$secret_key" ]]; then
 
+        quiet "host key: '%s' and the secret key '%s' in cleartext" "$public_key" "$secret_key"
         add_file "$public_key" "$srcdir/ed25519.pk"
         add_file "$secret_key" "$srcdir/.ed25519.sk"
 
     # Option C. fall back to the OpenSSH host key if no key directory is specified and the key is readable
     elif [[ -z "$SD_TINYSSH_KEYDIR" && -r "$openssh_host_key" ]]; then
 
+        quiet "host key: OpenSSH host key '%s', converted in cleartext" "$openssh_host_key"
         tinyssh-convert "$BUILDROOT$srcdir" <"$openssh_host_key"
         warning "Reusing the SSH host keys from the regular operating environment poses a security risk."
         warning "Initramfs is unencrypted and the SSH host key is exposed, so impersonation is easily possible."
@@ -55,7 +58,7 @@ build() {
     # Option D. no valid key found
     else
 
-        error "Missing SSH host key"
+        error "Missing SSH host key, checked '%s', '%s' and '%s'" "$secret_key_encrypted" "$secret_key" "$openssh_host_key"
         return 1
 
     fi
@@ -138,12 +141,16 @@ build() {
     add_dir /root/.ssh
 
     # tinyssh speaks ED25519 only, so every other key type is dropped here
+    quiet "authorized keys for root: '%s'" "$SD_TINYSSH_AUTHORIZED_KEYS"
     grep '^ssh-ed25519 ' "$SD_TINYSSH_AUTHORIZED_KEYS" >"$BUILDROOT/root/.ssh/authorized_keys"
     if [[ -s "$BUILDROOT/root/.ssh/authorized_keys" ]]; then
+        quiet "added %s of %s key(s), only ED25519 keys are accepted by tinyssh" \
+            "$(grep -c '' "$BUILDROOT/root/.ssh/authorized_keys")" \
+            "$(grep -c '^[^#[:space:]]' "$SD_TINYSSH_AUTHORIZED_KEYS")"
         chmod 600 "$BUILDROOT/root/.ssh/authorized_keys"
         chmod 700 "$BUILDROOT/root/.ssh"
     else
-        error "No ED25519 key found for root"
+        error "No ED25519 key found for root in '%s'" "$SD_TINYSSH_AUTHORIZED_KEYS"
         return 1
     fi
 
