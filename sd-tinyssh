@@ -17,6 +17,11 @@ build() {
 
     add_busybox || return
 
+    add_binary tinysshd-makekey
+
+    # holds the assembled key directory, unlike /run it is not carried over into the booted system
+    add_dir /tmp 1777
+
     # variable and defaults definition
     local keydir="${SD_TINYSSH_KEYDIR:-/etc/tinyssh/sshkeydir}"
     local public_key="$keydir/ed25519.pk"
@@ -24,26 +29,26 @@ build() {
     local secret_key_encrypted="$keydir/.ed25519.sk.enc"
     local openssh_host_key=/etc/ssh/ssh_host_ed25519_key
 
-    # appended to 'LoadCredential' in the service drop-in below
-    local encrypted=
+    # the key material is placed here, the start script below turns it into a key directory at boot
+    local srcdir=/etc/tinyssh
 
     # Option A. check if the public key and the encrypted secret key are readable
     if [[ -r "$public_key" && -r "$secret_key_encrypted" ]]; then
 
-        add_file "$public_key" /etc/credstore/ed25519.pk
-        add_file "$secret_key_encrypted" /etc/credstore.encrypted/.ed25519.sk
-        encrypted=Encrypted
+        add_file "$public_key" "$srcdir/ed25519.pk"
+        add_file "$secret_key_encrypted" "$srcdir/.ed25519.sk.enc"
+        add_binary systemd-creds
 
     # Option B. check if the public key and the cleartext secret key are readable
     elif [[ -r "$public_key" && -r "$secret_key" ]]; then
 
-        add_file "$public_key" /etc/credstore/ed25519.pk
-        add_file "$secret_key" /etc/credstore/.ed25519.sk
+        add_file "$public_key" "$srcdir/ed25519.pk"
+        add_file "$secret_key" "$srcdir/.ed25519.sk"
 
     # Option C. fall back to the OpenSSH host key if no key directory is specified and the key is readable
     elif [[ -z "$SD_TINYSSH_KEYDIR" && -r "$openssh_host_key" ]]; then
 
-        tinyssh-convert "$BUILDROOT/etc/credstore" <"$openssh_host_key"
+        tinyssh-convert "$BUILDROOT$srcdir" <"$openssh_host_key"
         warning "Reusing the SSH host keys from the regular operating environment poses a security risk."
         warning "Initramfs is unencrypted and the SSH host key is exposed, so impersonation is easily possible."
 
@@ -54,6 +59,37 @@ build() {
         return 1
 
     fi
+
+    # tinysshd is started through a script because the host key must be resolved without systemd:
+    # a credential that fails to decrypt fails its unit before any ExecStart= of that unit runs
+    local start_script=(
+        '#!/usr/bin/sh'
+        ''
+        'srcdir=/etc/tinyssh'
+        'keydir=/tmp/tinysshd'
+        ''
+        '# mkdir doubles as the lock, only the first connection assembles the key directory'
+        'if [ ! -s "$keydir/.ed25519.sk" ] && mkdir "$keydir" 2>/dev/null; then'
+        ''
+        '    chmod 700 "$keydir"'
+        ''
+        '    if [ -r "$srcdir/.ed25519.sk.enc" ] &&'
+        '       /usr/bin/systemd-creds decrypt --name= "$srcdir/.ed25519.sk.enc" "$keydir/.ed25519.sk"; then'
+        '        cp "$srcdir/ed25519.pk" "$keydir/ed25519.pk"'
+        '    elif [ -r "$srcdir/.ed25519.sk" ]; then'
+        '        cp "$srcdir/ed25519.pk" "$srcdir/.ed25519.sk" "$keydir/"'
+        '    else'
+        '        # a key sealed to the TPM is lost when the platform state changes, e.g. on a firmware update'
+        '        echo "tinyssh-start: no usable host key, generating a throwaway key" >&2'
+        '        rm -rf "$keydir" && /usr/bin/tinysshd-makekey -q "$keydir"'
+        '    fi'
+        ''
+        'fi'
+        ''
+        'exec /usr/bin/tinysshd "$@" "$keydir"'
+    )
+    printf "%s\n" "${start_script[@]}" > "$BUILDROOT/usr/bin/tinyssh-start"
+    chmod 755 "$BUILDROOT/usr/bin/tinyssh-start"
 
     # add the systemd units for tinyssh
     add_systemd_unit tinyssh@.socket
@@ -85,9 +121,7 @@ build() {
         ""
         "[Service]"
         "ExecStart="
-        "ExecStart=-/usr/bin/tinysshd ${SD_TINYSSH_COMMAND:+-e '${SD_TINYSSH_COMMAND}' }\${CREDENTIALS_DIRECTORY}"
-        "LoadCredential=ed25519.pk"
-        "LoadCredential${encrypted}=.ed25519.sk"
+        "ExecStart=-/usr/bin/tinyssh-start ${SD_TINYSSH_COMMAND:+-e '${SD_TINYSSH_COMMAND}'}"
     )
     printf "%s\n" "${drop_in[@]}" | add_systemd_drop_in tinyssh@.service override
 
@@ -135,6 +169,15 @@ Host keys are copied from \$SD_TINYSSH_KEYDIR (default /etc/tinyssh/sshkeydir).
 A secret host key '.ed25519.sk.enc' encrypted with systemd-creds is preferred.
 As a last resort the OpenSSH host key /etc/ssh/ssh_host_ed25519_key is
 converted on the fly.  This last option requires python to be installed.
+
+The key material is unpacked at boot by /usr/bin/tinyssh-start, which decrypts
+an encrypted secret key itself instead of leaving it to systemd. An encrypted
+host key cannot be decrypted any more once the state it is sealed to changes,
+e.g. after a firmware update, and a failing credential would take the whole ssh
+server down with it. In that case the script generates a throwaway host key, so
+that a volume can still be unlocked from remote. The ssh client reports a
+changed host key then and refuses to connect until the old key is removed from
+its known_hosts file.
 
 By default tinyssh presents the busybox shell after successful login. Two
 variables can be used to alter this behavior:
