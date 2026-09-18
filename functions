@@ -124,7 +124,7 @@ tinyssh_add_cleartext_key() {
     add_file "$1" /etc/credstore/ed25519.pk || return
     add_file "$2" /etc/credstore/.ed25519.sk || return
 
-    warning "Initramfs is unencrypted and the SSH host key is exposed, so impersonation is easily possible."
+    warning "Initramfs is unencrypted, so the included dedicated SSH Host Key is exposed and might be missused for impersonation!"
 }
 
 # seals the secret key to the TPM and adds the script that unseals it at boot
