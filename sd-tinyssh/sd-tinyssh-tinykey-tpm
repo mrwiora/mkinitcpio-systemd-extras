@@ -6,22 +6,12 @@ build() {
 
     tinyssh_add_base || return
 
-    local keydir="${SD_TINYSSH_KEYDIR:-/etc/tinyssh/sshkeydir}"
-    local public_key="$keydir/ed25519.pk"
-    local secret_key_encrypted="$keydir/.ed25519.sk.enc"
+    local keydir
+    keydir="$(tinyssh_key_directory)" || return
 
-    if [[ ! -r "$public_key" || ! -r "$secret_key_encrypted" ]]; then
-        error "Missing SSH host key, checked '%s' and '%s'" "$public_key" "$secret_key_encrypted"
-        return 1
-    fi
+    msg "host key: the tinyssh key pair in '%s', sealed to the TPM" "$keydir"
 
-    quiet "host key: '%s' and the secret key '%s' encrypted with systemd-creds" \
-        "$public_key" "$secret_key_encrypted"
-
-    add_file "$public_key" /etc/tinyssh/ed25519.pk
-    add_file "$secret_key_encrypted" /etc/tinyssh/.ed25519.sk.enc
-
-    tinyssh_add_start_script
+    tinyssh_add_sealed_key "$keydir/ed25519.pk" "$keydir/.ed25519.sk" || return
 
     tinyssh_add_server \
         "ExecStart=" \
@@ -40,27 +30,35 @@ for details.
 The hook copies all files and binaries required by tinyssh to the initramfs
 image and enables listening TCP port 22 (or some other).
 
-This variant expects a secret host key that was encrypted with systemd-creds
-beforehand. Create the key pair and encrypt the secret key with:
+The host key is a key pair of tinyssh's own, which has to be created
+beforehand:
 
   tinysshd-makekey /etc/tinyssh/sshkeydir
-  systemd-creds encrypt --with-key=tpm2 --tpm2-pcrs=0+7 \\
-      /etc/tinyssh/sshkeydir/.ed25519.sk /etc/tinyssh/sshkeydir/.ed25519.sk.enc
-
-The name embedded by '--name=' does not matter, but encrypting with
-'--with-key=host' or the default '--with-key=auto' does not work, as the host
-key /var/lib/systemd/credential.secret is not part of the initramfs.
-
-A key sealed to the TPM cannot be decrypted any more once the measured state
-changes, e.g. after a firmware update. At boot /usr/bin/tinyssh-start then
-generates a throwaway host key, so that a volume can still be unlocked from
-remote. The ssh client reports a changed host key in that case and refuses to
-connect until the old key is removed from its known_hosts file, e.g. with
-'ssh-keygen -R <host>'. Encrypting the key again is left to you; use hook
-'sd-tinyssh-tpm' to have that done on every build of the image.
 
 Set \$SD_TINYSSH_KEYDIR to use a key directory other than
 /etc/tinyssh/sshkeydir.
+
+The secret key is sealed to the TPM while the image is built, so it is of no
+use to anyone who reads the unencrypted initramfs. Sealing happens on every
+rebuild, against the PCR values of the moment, which repairs the host key after
+a firmware update: boot once, unlock the volume, and the next 'mkinitcpio' run
+makes the image work again.
+
+Set SD_TINYSSH_TPM2_PCRS to the PCRs to seal against, e.g. "0+7". If it is
+unset, the default of systemd-creds is used, which is PCR 7 alone.
+
+At boot /usr/bin/tinyssh-start unseals the key itself instead of leaving that
+to systemd, because a credential that cannot be decrypted fails its unit before
+the server is even started. Should the unsealing fail, the script generates a
+throwaway host key, so that a volume can still be unlocked from remote. The ssh
+client reports a changed host key then and refuses to connect until the old key
+is removed from its known_hosts file, e.g. with 'ssh-keygen -R <host>'.
+
+Related hooks, differing in the host key they use:
+
+  sd-tinyssh-tinykey      tinyssh key pair, in cleartext
+  sd-tinyssh-tinykey-tpm  tinyssh key pair, sealed to the TPM
+  sd-tinyssh-openssh-tpm  OpenSSH host key of this system, sealed to the TPM
 
 By default tinyssh presents the busybox shell after successful login. Two
 variables can be used to alter this behavior:
@@ -81,8 +79,11 @@ SD_TINYSSH_COMMAND takes precedence.
 
 Set SD_TINYSSH_PORT to specify a port other than 22.
 
-Set SD_TINYSSH_AUTHORIZED_KEYS to specify a keys file other than
-/root/.ssh/authorized_keys.
+Login is allowed for the public keys taken from /root/.ssh/authorized_keys of
+this system, which are copied into the image. tinyssh speaks ED25519 only, so
+entries of every other key type are dropped and at least one 'ssh-ed25519'
+entry has to be present. Set SD_TINYSSH_AUTHORIZED_KEYS to read the keys from
+another file.
 
 If required the above mentioned variables must be set in /etc/mkinitcpio.conf.
 __EOF_HELP__

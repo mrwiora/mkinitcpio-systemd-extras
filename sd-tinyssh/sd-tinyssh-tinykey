@@ -6,38 +6,12 @@ build() {
 
     tinyssh_add_base || return
 
-    local keydir="${SD_TINYSSH_KEYDIR:-/etc/tinyssh/sshkeydir}"
-    local public_key="$keydir/ed25519.pk"
-    local secret_key="$keydir/.ed25519.sk"
-    local tmpdir=
+    local keydir
+    keydir="$(tinyssh_key_directory)" || return
 
-    if [[ -r "$public_key" && -r "$secret_key" ]]; then
+    msg "host key: the tinyssh key pair in '%s', stored in cleartext" "$keydir"
 
-        quiet "host key: '%s' and the secret key '%s'" "$public_key" "$secret_key"
-
-    elif [[ -z "$SD_TINYSSH_KEYDIR" ]]; then
-
-        tmpdir="$(mktemp -d)" || return 1
-        if ! tinyssh_convert_openssh_key "$tmpdir/sshkeydir"; then
-            rm -rf -- "$tmpdir"
-            return 1
-        fi
-        public_key="$tmpdir/sshkeydir/ed25519.pk"
-        secret_key="$tmpdir/sshkeydir/.ed25519.sk"
-
-    else
-
-        error "Missing SSH host key in '%s'" "$keydir"
-        return 1
-
-    fi
-
-    add_file "$public_key" /etc/credstore/ed25519.pk
-    add_file "$secret_key" /etc/credstore/.ed25519.sk
-
-    [[ -n "$tmpdir" ]] && rm -rf -- "$tmpdir"
-
-    warning "Initramfs is unencrypted and the SSH host key is exposed, so impersonation is easily possible."
+    tinyssh_add_cleartext_key "$keydir/ed25519.pk" "$keydir/.ed25519.sk" || return
 
     tinyssh_add_server \
         "ExecStart=" \
@@ -58,20 +32,23 @@ for details.
 The hook copies all files and binaries required by tinyssh to the initramfs
 image and enables listening TCP port 22 (or some other).
 
-This variant stores the secret host key in cleartext. Create the key pair
-beforehand with:
+The host key is a key pair of tinyssh's own, which has to be created
+beforehand:
 
   tinysshd-makekey /etc/tinyssh/sshkeydir
 
 Set \$SD_TINYSSH_KEYDIR to use a key directory other than
-/etc/tinyssh/sshkeydir. If it is left unset and no key pair exists there, the
-OpenSSH host key /etc/ssh/ssh_host_ed25519_key of the running system is
-converted on the fly instead. That conversion requires python to be installed.
+/etc/tinyssh/sshkeydir.
 
-The initramfs is unencrypted, so anyone who can read the image obtains the
-secret host key and can impersonate this machine. Use hook 'sd-tinyssh-tpm' to
-have the key protected by the TPM, or 'sd-tinyssh-creds' to supply a key that
-was encrypted beforehand.
+The secret key is stored in cleartext. The initramfs is unencrypted, so anyone
+who can read the image obtains the key and can impersonate this machine. Use
+hook 'sd-tinyssh-tinykey-tpm' to have the key sealed to the TPM instead.
+
+Related hooks, differing in the host key they use:
+
+  sd-tinyssh-tinykey      tinyssh key pair, in cleartext
+  sd-tinyssh-tinykey-tpm  tinyssh key pair, sealed to the TPM
+  sd-tinyssh-openssh-tpm  OpenSSH host key of this system, sealed to the TPM
 
 By default tinyssh presents the busybox shell after successful login. Two
 variables can be used to alter this behavior:
@@ -92,8 +69,11 @@ SD_TINYSSH_COMMAND takes precedence.
 
 Set SD_TINYSSH_PORT to specify a port other than 22.
 
-Set SD_TINYSSH_AUTHORIZED_KEYS to specify a keys file other than
-/root/.ssh/authorized_keys.
+Login is allowed for the public keys taken from /root/.ssh/authorized_keys of
+this system, which are copied into the image. tinyssh speaks ED25519 only, so
+entries of every other key type are dropped and at least one 'ssh-ed25519'
+entry has to be present. Set SD_TINYSSH_AUTHORIZED_KEYS to read the keys from
+another file.
 
 If required the above mentioned variables must be set in /etc/mkinitcpio.conf.
 __EOF_HELP__

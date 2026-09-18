@@ -82,24 +82,72 @@ tinyssh_add_base() {
     add_busybox
 }
 
-# converts the OpenSSH host key of the running system into a tinyssh key pair in $1
+# prints the tinyssh key directory after making sure that it holds a readable key pair
+tinyssh_key_directory() {
+    local keydir="${SD_TINYSSH_KEYDIR:-/etc/tinyssh/sshkeydir}"
+
+    if [[ ! -r "$keydir/ed25519.pk" || ! -r "$keydir/.ed25519.sk" ]]; then
+        error "Missing tinyssh key pair in '%s', create it with 'tinysshd-makekey %s'" "$keydir" "$keydir"
+        return 1
+    fi
+
+    printf '%s' "$keydir"
+}
+
+# converts the OpenSSH host key of the running system and prints the temporary key directory,
+# which the caller has to remove again
 tinyssh_convert_openssh_key() {
-    local target="$1" openssh_host_key=/etc/ssh/ssh_host_ed25519_key
+    local openssh_host_key=/etc/ssh/ssh_host_ed25519_key
 
     if [[ ! -r "$openssh_host_key" ]]; then
         error "OpenSSH host key '%s' does not exist (or not readable)" "$openssh_host_key"
         return 1
     fi
 
-    quiet "host key: converted from the OpenSSH host key '%s'" "$openssh_host_key"
+    local tmpdir
+    tmpdir="$(mktemp -d)" || return 1
 
-    # tinyssh-convert creates the key directory itself and refuses to write into an existing one
-    if ! tinyssh-convert "$target" <"$openssh_host_key"; then
+    # tinyssh-convert creates the key directory itself and refuses to write into an existing one,
+    # its output must not end up in the key directory path printed below
+    if ! tinyssh-convert "$tmpdir/sshkeydir" <"$openssh_host_key" >&2; then
+        rm -rf -- "$tmpdir"
         error "Conversion of the OpenSSH host key '%s' failed" "$openssh_host_key"
         return 1
     fi
 
-    warning "Reusing the SSH host key from the regular operating environment poses a security risk."
+    printf '%s' "$tmpdir/sshkeydir"
+}
+
+# stores the key pair as a systemd credential, readable by anyone who can read the image
+#   $1: public key, $2: secret key
+tinyssh_add_cleartext_key() {
+    add_file "$1" /etc/credstore/ed25519.pk || return
+    add_file "$2" /etc/credstore/.ed25519.sk || return
+
+    warning "Initramfs is unencrypted and the SSH host key is exposed, so impersonation is easily possible."
+}
+
+# seals the secret key to the TPM and adds the script that unseals it at boot
+#   $1: public key, $2: secret key
+tinyssh_add_sealed_key() {
+    local pcrs=()
+    [[ -n "$SD_TINYSSH_TPM2_PCRS" ]] && pcrs=( --tpm2-pcrs="$SD_TINYSSH_TPM2_PCRS" )
+
+    add_dir /etc/tinyssh 700
+
+    # sealing on every build renews the policy whenever the measured state changed
+    if ! systemd-creds encrypt --with-key=tpm2 "${pcrs[@]}" --name= \
+            "$2" "$BUILDROOT/etc/tinyssh/.ed25519.sk.enc"; then
+        error "Sealing the secret key '%s' to the TPM failed" "$2"
+        return 1
+    fi
+
+    msg "sealed the secret key to TPM2 PCRs %s" "${SD_TINYSSH_TPM2_PCRS:-7 (default)}"
+
+    chmod 600 "$BUILDROOT/etc/tinyssh/.ed25519.sk.enc"
+    add_file "$1" /etc/tinyssh/ed25519.pk || return
+
+    tinyssh_add_start_script
 }
 
 # expands to the '-e <command>' option of tinysshd when SD_TINYSSH_COMMAND is set
@@ -155,7 +203,7 @@ tinyssh_add_server() {
         error "Illegal value SD_TINYSSH_PORT=$SD_TINYSSH_PORT"
         return 1
     fi
-    quiet "tinysshd listens on TCP port %s" "$SD_TINYSSH_PORT"
+    msg "tinysshd listens on TCP port %s" "$SD_TINYSSH_PORT"
 
     add_symlink "/etc/systemd/system/sysinit.target.wants/tinyssh@$SD_TINYSSH_PORT.socket" \
         /usr/lib/systemd/system/tinyssh@.socket
@@ -196,7 +244,7 @@ tinyssh_add_authorized_keys() {
 
     add_dir /root/.ssh
 
-    quiet "authorized keys for root: '%s'" "$SD_TINYSSH_AUTHORIZED_KEYS"
+    msg "authorized keys for root: '%s'" "$SD_TINYSSH_AUTHORIZED_KEYS"
 
     # tinyssh speaks ED25519 only, so every other key type is dropped here
     grep '^ssh-ed25519 ' "$SD_TINYSSH_AUTHORIZED_KEYS" >"$BUILDROOT/root/.ssh/authorized_keys"
@@ -205,7 +253,7 @@ tinyssh_add_authorized_keys() {
         return 1
     fi
 
-    quiet "added %s of %s key(s), only ED25519 keys are accepted by tinyssh" \
+    msg "added %s of %s key(s), only ED25519 keys are accepted by tinyssh" \
         "$(grep -c '' "$BUILDROOT/root/.ssh/authorized_keys")" \
         "$(grep -c '^[^#[:space:]]' "$SD_TINYSSH_AUTHORIZED_KEYS")"
 
