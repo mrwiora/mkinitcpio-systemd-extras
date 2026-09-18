@@ -1,10 +1,13 @@
 #!/bin/bash
 
 build() {
-    # Host key sources, in order of preference:
-    #   1. public key + secret key encrypted with systemd-creds
-    #   2. public key + secret key in cleartext
-    #   3. OpenSSH host key of the running system, converted on the fly
+    # Key pair sources, in order of preference:
+    #   1. public key + secret key from the key directory
+    #   2. OpenSSH host key of the running system, converted on the fly
+    # Storage in the image, in order of preference:
+    #   1. secret key sealed to the TPM during this build
+    #   2. secret key encrypted with systemd-creds beforehand
+    #   3. secret key in cleartext
 
     # tinysshd and tinyssh-convert are taken from the host installation, so the package must be installed
     if ! pacman -Qi tinyssh >/dev/null 2>&1; then
@@ -32,31 +35,86 @@ build() {
     # the key material is placed here, the start script below turns it into a key directory at boot
     local srcdir=/etc/tinyssh
 
-    # Option A. check if the public key and the encrypted secret key are readable
-    if [[ -r "$public_key" && -r "$secret_key_encrypted" ]]; then
+    # Step 1. locate a key pair in cleartext, either in the key directory or converted from the
+    # OpenSSH host key of the running system
+    local plain_public_key= plain_secret_key= tmpdir=
+
+    if [[ -r "$public_key" && -r "$secret_key" ]]; then
+
+        plain_public_key="$public_key"
+        plain_secret_key="$secret_key"
+
+    elif [[ -z "$SD_TINYSSH_KEYDIR" && -r "$openssh_host_key" ]]; then
+
+        # tinyssh-convert creates the key directory itself and refuses to write into an existing one
+        tmpdir="$(mktemp -d)" || return 1
+        if ! tinyssh-convert "$tmpdir/sshkeydir" <"$openssh_host_key"; then
+            rm -rf -- "$tmpdir"
+            error "Conversion of the OpenSSH host key '%s' failed" "$openssh_host_key"
+            return 1
+        fi
+        plain_public_key="$tmpdir/sshkeydir/ed25519.pk"
+        plain_secret_key="$tmpdir/sshkeydir/.ed25519.sk"
+
+    fi
+
+    # Step 2. store the key pair in the image, in order of preference
+    local stored=
+
+    # Option A. seal the cleartext secret key to the TPM, sealing on every build renews the policy
+    # whenever the measured state changed, e.g. after a firmware update
+    if [[ -n "$SD_TINYSSH_TPM2_PCRS" && -n "$plain_secret_key" ]]; then
+
+        add_dir "$srcdir" 700
+        if systemd-creds encrypt --with-key=tpm2 --tpm2-pcrs="$SD_TINYSSH_TPM2_PCRS" --name= \
+                "$plain_secret_key" "$BUILDROOT$srcdir/.ed25519.sk.enc"; then
+
+            quiet "host key: '%s' and the secret key '%s', sealed to TPM2 PCRs %s" \
+                "$plain_public_key" "$plain_secret_key" "$SD_TINYSSH_TPM2_PCRS"
+            chmod 600 "$BUILDROOT$srcdir/.ed25519.sk.enc"
+            add_file "$plain_public_key" "$srcdir/ed25519.pk"
+            add_binary systemd-creds
+            stored=plain
+
+        else
+
+            warning "Sealing the secret key to TPM2 PCRs $SD_TINYSSH_TPM2_PCRS failed"
+
+        fi
+
+    fi
+
+    # Option B. use the secret key that was encrypted with systemd-creds beforehand
+    if [[ -z "$stored" && -r "$public_key" && -r "$secret_key_encrypted" ]]; then
 
         quiet "host key: '%s' and the secret key '%s' encrypted with systemd-creds" "$public_key" "$secret_key_encrypted"
         add_file "$public_key" "$srcdir/ed25519.pk"
         add_file "$secret_key_encrypted" "$srcdir/.ed25519.sk.enc"
         add_binary systemd-creds
+        stored=encrypted
 
-    # Option B. check if the public key and the cleartext secret key are readable
-    elif [[ -r "$public_key" && -r "$secret_key" ]]; then
+    fi
 
-        quiet "host key: '%s' and the secret key '%s' in cleartext" "$public_key" "$secret_key"
-        add_file "$public_key" "$srcdir/ed25519.pk"
-        add_file "$secret_key" "$srcdir/.ed25519.sk"
+    # Option C. keep the secret key in cleartext
+    if [[ -z "$stored" && -n "$plain_secret_key" ]]; then
 
-    # Option C. fall back to the OpenSSH host key if no key directory is specified and the key is readable
-    elif [[ -z "$SD_TINYSSH_KEYDIR" && -r "$openssh_host_key" ]]; then
-
-        quiet "host key: OpenSSH host key '%s', converted in cleartext" "$openssh_host_key"
-        tinyssh-convert "$BUILDROOT$srcdir" <"$openssh_host_key"
-        warning "Reusing the SSH host keys from the regular operating environment poses a security risk."
+        quiet "host key: '%s' and the secret key '%s' in cleartext" "$plain_public_key" "$plain_secret_key"
+        add_file "$plain_public_key" "$srcdir/ed25519.pk"
+        add_file "$plain_secret_key" "$srcdir/.ed25519.sk"
         warning "Initramfs is unencrypted and the SSH host key is exposed, so impersonation is easily possible."
+        stored=plain
+
+    fi
+
+    # the converted key is the identity of the running system, unlike a key of its own
+    if [[ -n "$tmpdir" ]]; then
+        [[ "$stored" == plain ]] &&
+            warning "Reusing the SSH host key from the regular operating environment poses a security risk."
+        rm -rf -- "$tmpdir"
+    fi
 
     # Option D. no valid key found
-    else
+    if [[ -z "$stored" ]]; then
 
         error "Missing SSH host key, checked '%s', '%s' and '%s'" "$secret_key_encrypted" "$secret_key" "$openssh_host_key"
         return 1
@@ -176,6 +234,13 @@ Host keys are copied from \$SD_TINYSSH_KEYDIR (default /etc/tinyssh/sshkeydir).
 A secret host key '.ed25519.sk.enc' encrypted with systemd-creds is preferred.
 As a last resort the OpenSSH host key /etc/ssh/ssh_host_ed25519_key is
 converted on the fly.  This last option requires python to be installed.
+
+Set SD_TINYSSH_TPM2_PCRS to a PCR list, e.g. "0+7", to have the secret key
+sealed to the TPM by this hook instead of supplying an already encrypted
+'.ed25519.sk.enc'. This works for the key directory as well as for the converted
+OpenSSH host key, and the key is resealed against the current PCR values on
+every rebuild of the image, which repairs the host key after a firmware update.
+If sealing fails, the key is stored in cleartext.
 
 The key material is unpacked at boot by /usr/bin/tinyssh-start, which decrypts
 an encrypted secret key itself instead of leaving it to systemd. An encrypted
