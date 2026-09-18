@@ -9,13 +9,15 @@ build() {
     local keydir
     keydir="$(tinyssh_key_directory)" || return
 
-    msg "host key: the tinyssh key pair in '%s', sealed to the TPM" "$keydir"
+    msg "host key: the tinyssh key pair in '%s', stored in cleartext" "$keydir"
 
-    tinyssh_add_sealed_key "$keydir/ed25519.pk" "$keydir/.ed25519.sk" || return
+    tinyssh_add_cleartext_key "$keydir/ed25519.pk" "$keydir/.ed25519.sk" || return
 
     tinyssh_add_server \
         "ExecStart=" \
-        "ExecStart=-/usr/bin/tinyssh-start $(tinyssh_command_option)"
+        "ExecStart=-/usr/bin/tinysshd $(tinyssh_command_option)\${CREDENTIALS_DIRECTORY}" \
+        "LoadCredential=ed25519.pk" \
+        "LoadCredential=.ed25519.sk"
 }
 
 help() {
@@ -38,27 +40,15 @@ beforehand:
 Set \$SD_TINYSSH_KEYDIR to use a key directory other than
 /etc/tinyssh/sshkeydir.
 
-The secret key is sealed to the TPM while the image is built, so it is of no
-use to anyone who reads the unencrypted initramfs. Sealing happens on every
-rebuild, against the PCR values of the moment, which repairs the host key after
-a firmware update: boot once, unlock the volume, and the next 'mkinitcpio' run
-makes the image work again.
-
-Set SD_TINYSSH_TPM2_PCRS to the PCRs to seal against, e.g. "0+7". If it is
-unset, the default of systemd-creds is used, which is PCR 7 alone.
-
-At boot /usr/bin/tinyssh-start unseals the key itself instead of leaving that
-to systemd, because a credential that cannot be decrypted fails its unit before
-the server is even started. Should the unsealing fail, the script generates a
-throwaway host key, so that a volume can still be unlocked from remote. The ssh
-client reports a changed host key then and refuses to connect until the old key
-is removed from its known_hosts file, e.g. with 'ssh-keygen -R <host>'.
+The secret key is stored in cleartext. The initramfs is unencrypted, so anyone
+who can read the image obtains the key and can impersonate this machine. Use
+hook 'sd-tinyssh-tinykey-tpm2' to have the key sealed to the TPM instead.
 
 Related hooks, differing in the host key they use:
 
-  sd-tinyssh-tinykey      tinyssh key pair, in cleartext
-  sd-tinyssh-tinykey-tpm  tinyssh key pair, sealed to the TPM
-  sd-tinyssh-openssh-tpm  OpenSSH host key of this system, sealed to the TPM
+  sd-tinyssh-tinykey-cleartext  tinyssh key pair, in cleartext
+  sd-tinyssh-tinykey-tpm2       tinyssh key pair, sealed to the TPM
+  sd-tinyssh-openssh-tpm2       OpenSSH host key of the system, sealed to TPM
 
 By default tinyssh presents the busybox shell after successful login. Two
 variables can be used to alter this behavior:
