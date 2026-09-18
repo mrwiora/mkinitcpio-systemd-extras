@@ -147,6 +147,13 @@ tinyssh_add_sealed_key() {
     chmod 600 "$BUILDROOT/etc/tinyssh/.ed25519.sk.enc"
     add_file "$1" /etc/tinyssh/ed25519.pk || return
 
+    # the sealed values are taken from a running system, where systemd has already extended the OS
+    # separator into PCR 0-7, 9 and 12-14; ordering against a unit that never starts is a no-op
+    printf "%s\n" \
+        '[Unit]' \
+        'After=systemd-pcrosseparator.service' |
+        add_systemd_drop_in tinyssh@.service pcr-order
+
     tinyssh_add_start_script
 }
 
