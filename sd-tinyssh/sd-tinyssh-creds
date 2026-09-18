@@ -1,0 +1,89 @@
+#!/bin/bash
+
+build() {
+    # mkinitcpio does not source the helpers when the hook is run standalone
+    declare -F tinyssh_add_server >/dev/null || . /usr/lib/initcpio/functions.d/systemd-extras
+
+    tinyssh_add_base || return
+
+    local keydir="${SD_TINYSSH_KEYDIR:-/etc/tinyssh/sshkeydir}"
+    local public_key="$keydir/ed25519.pk"
+    local secret_key_encrypted="$keydir/.ed25519.sk.enc"
+
+    if [[ ! -r "$public_key" || ! -r "$secret_key_encrypted" ]]; then
+        error "Missing SSH host key, checked '%s' and '%s'" "$public_key" "$secret_key_encrypted"
+        return 1
+    fi
+
+    quiet "host key: '%s' and the secret key '%s' encrypted with systemd-creds" \
+        "$public_key" "$secret_key_encrypted"
+
+    add_file "$public_key" /etc/tinyssh/ed25519.pk
+    add_file "$secret_key_encrypted" /etc/tinyssh/.ed25519.sk.enc
+
+    tinyssh_add_start_script
+
+    tinyssh_add_server \
+        "ExecStart=" \
+        "ExecStart=-/usr/bin/tinyssh-start $(tinyssh_command_option)"
+}
+
+help() {
+    cat <<__EOF_HELP__
+This hook enables tinyssh during the initramfs phase. It is only applicable for
+a systemd based intramfs phase, i.e. hook 'systemd' must be given in the HOOKS
+array in mkinitcpio.conf.
+
+See https://github.com/wolegis/mkinitcpio-systemd-extras/wiki/TinySSH-server
+for details.
+
+The hook copies all files and binaries required by tinyssh to the initramfs
+image and enables listening TCP port 22 (or some other).
+
+This variant expects a secret host key that was encrypted with systemd-creds
+beforehand. Create the key pair and encrypt the secret key with:
+
+  tinysshd-makekey /etc/tinyssh/sshkeydir
+  systemd-creds encrypt --with-key=tpm2 --tpm2-pcrs=0+7 \\
+      /etc/tinyssh/sshkeydir/.ed25519.sk /etc/tinyssh/sshkeydir/.ed25519.sk.enc
+
+The name embedded by '--name=' does not matter, but encrypting with
+'--with-key=host' or the default '--with-key=auto' does not work, as the host
+key /var/lib/systemd/credential.secret is not part of the initramfs.
+
+A key sealed to the TPM cannot be decrypted any more once the measured state
+changes, e.g. after a firmware update. At boot /usr/bin/tinyssh-start then
+generates a throwaway host key, so that a volume can still be unlocked from
+remote. The ssh client reports a changed host key in that case and refuses to
+connect until the old key is removed from its known_hosts file, e.g. with
+'ssh-keygen -R <host>'. Encrypting the key again is left to you; use hook
+'sd-tinyssh-tpm' to have that done on every build of the image.
+
+Set \$SD_TINYSSH_KEYDIR to use a key directory other than
+/etc/tinyssh/sshkeydir.
+
+By default tinyssh presents the busybox shell after successful login. Two
+variables can be used to alter this behavior:
+
+SD_TINYSSH_COMMAND defines a shell command. The string is appended to 'sh -c',
+i.e. it may contain blanks, quotes and all kinds of special characters that are
+interpreted by the shell.  Example: To allow to unlock LUKS encrypted volumes
+from remote (but nothing else, especially no shell access) set:
+SD_TINYSSH_COMMAND="systemd-tty-ask-password-agent --query --watch"
+
+SD_TINYSSH_SCRIPT defines a file with shell commands that are executed before
+the interactive shell is presented. Example: To allow to unlock LUKS encrypted
+volumes from remote but also escape to an interactive shell with CTRL-C specify
+a file that contains:
+systemd-tty-ask-password-agent --query --watch
+
+SD_TINYSSH_COMMAND takes precedence.
+
+Set SD_TINYSSH_PORT to specify a port other than 22.
+
+Set SD_TINYSSH_AUTHORIZED_KEYS to specify a keys file other than
+/root/.ssh/authorized_keys.
+
+If required the above mentioned variables must be set in /etc/mkinitcpio.conf.
+__EOF_HELP__
+}
